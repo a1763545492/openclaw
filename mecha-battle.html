@@ -81,6 +81,14 @@
     防御可减伤 80%，但无法移动；攻击有冷却，跳起重击伤害更高
   </div>
   <button id="restart">再来一局 (R)</button>
+  <div id="startOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;cursor:pointer;">
+    <div style="color:#ffd23f;font-size:24px;letter-spacing:3px;text-shadow:3px 3px 0 #b45309;margin-bottom:20px;">PIXEL MECHA BATTLE</div>
+    <div style="color:#e8e8f0;font-size:12px;margin-bottom:8px;">点击此处开始游戏</div>
+    <div style="color:#8b90a8;font-size:9px;line-height:1.8;text-align:center;">
+      P1: A/D 移动 · W 跳跃 · F 攻击 · G 防御<br/>
+      P2: ←/→ 移动 · ↑ 跳跃 · K 攻击 · L 防御
+    </div>
+  </div>
 
 <script>
 /* ============================================================
@@ -130,13 +138,39 @@ const PAL = {
 // ---------- 2. 输入 ----------
 const keys = {};
 const pressed = {}; // 边沿触发：本帧新按下
+
+// e.code 兼容性：旧浏览器可能没有 e.code，用 keyCode 映射
+const KEYCODE_MAP = {
+  65:'KeyA', 68:'KeyD', 87:'KeyW', 70:'KeyF', 71:'KeyG', // P1
+  37:'ArrowLeft', 39:'ArrowRight', 38:'ArrowUp', 75:'KeyK', 76:'KeyL', // P2
+  82:'KeyR',
+};
+// 所有游戏按键（用于 preventDefault，避免浏览器快捷键/输入法/滚动干扰）
+const GAME_KEYS = new Set([
+  'KeyA','KeyD','KeyW','KeyF','KeyG',
+  'ArrowLeft','ArrowRight','ArrowUp','KeyK','KeyL',
+  'KeyR','Space',
+]);
+
+function getCode(e) {
+  if (e.code) return e.code;
+  return KEYCODE_MAP[e.keyCode] || ('Unknown_' + e.keyCode);
+}
+
 window.addEventListener('keydown', (e) => {
-  if (!keys[e.code]) pressed[e.code] = true;
-  keys[e.code] = true;
-  // 防止方向键滚屏
-  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  const code = getCode(e);
+  if (GAME_KEYS.has(code)) e.preventDefault();
+  if (!keys[code]) pressed[code] = true;
+  keys[code] = true;
 });
-window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+window.addEventListener('keyup', (e) => {
+  const code = getCode(e);
+  keys[code] = false;
+});
+// 窗口失焦时清空所有按键，避免"卡住"
+window.addEventListener('blur', () => {
+  for (const k in keys) keys[k] = false;
+});
 
 function consumePressed(code) {
   if (pressed[code]) { pressed[code] = false; return true; }
@@ -621,10 +655,45 @@ function draw() {
     ctx.fillText('按 R 或点击按钮重新开始', VIEW_W/2, VIEW_H/2 + 24);
     ctx.textAlign = 'left';
   }
+
+  // 底部按键状态指示（帮助确认键盘输入是否被捕获）
+  drawKeyHUD();
+}
+
+function drawKeyHUD() {
+  const y = VIEW_H - 16;
+  ctx.font = '8px "Courier New", monospace';
+  ctx.textBaseline = 'middle';
+  // P1 按键
+  const p1keys = [
+    {k:'A', v:keys['KeyA']}, {k:'D', v:keys['KeyD']},
+    {k:'W', v:keys['KeyW']}, {k:'F', v:pressed['KeyF']||p1.attackTimer>0}, {k:'G', v:keys['KeyG']},
+  ];
+  let x = 12;
+  ctx.fillStyle = '#8b90a8';
+  ctx.fillText('P1:', x, y); x += 22;
+  for (const {k,v} of p1keys) {
+    ctx.fillStyle = v ? '#ffd23f' : '#3a3550';
+    ctx.fillText(k, x, y); x += 10;
+  }
+  // P2 按键
+  const p2keys = [
+    {k:'\u2190', v:keys['ArrowLeft']}, {k:'\u2192', v:keys['ArrowRight']},
+    {k:'\u2191', v:keys['ArrowUp']}, {k:'K', v:pressed['KeyK']||p2.attackTimer>0}, {k:'L', v:keys['KeyL']},
+  ];
+  x = VIEW_W - 12;
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#8b90a8';
+  ctx.fillText(':P2', x, y); x -= 22;
+  for (let i = p2keys.length-1; i >= 0; i--) {
+    ctx.fillStyle = p2keys[i].v ? '#5bc0ff' : '#3a3550';
+    ctx.fillText(p2keys[i].k, x, y); x -= 10;
+  }
+  ctx.textAlign = 'left';
 }
 
 function loop() {
-  update();
+  if (gameStarted) update();
   draw();
   requestAnimationFrame(loop);
 }
@@ -632,7 +701,21 @@ function loop() {
 // 重开
 document.getElementById('restart').addEventListener('click', resetGame);
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'KeyR' && gameOver) resetGame();
+  if (getCode(e) === 'KeyR' && gameOver) resetGame();
+});
+
+// 启动遮罩：点击后开始游戏（确保页面获得键盘焦点）
+let gameStarted = false;
+const startOverlay = document.getElementById('startOverlay');
+function startGame() {
+  gameStarted = true;
+  startOverlay.style.display = 'none';
+  window.focus();
+}
+startOverlay.addEventListener('click', startGame);
+// 支持按任意键开始
+window.addEventListener('keydown', function onFirstKey() {
+  if (!gameStarted) startGame();
 });
 
 // 启动
