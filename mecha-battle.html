@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>像素机甲对战 · Pixel Mecha Battle</title>
+<style>
+  :root {
+    --bg: #0b0d17;
+    --panel: #14182b;
+    --accent: #ffd23f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: #e8e8f0;
+    font-family: "Press Start 2P", "Courier New", monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    image-rendering: pixelated;
+  }
+  h1 {
+    font-size: 20px;
+    letter-spacing: 2px;
+    color: var(--accent);
+    text-shadow: 3px 3px 0 #b45309;
+    margin-bottom: 10px;
+  }
+  .sub {
+    font-size: 10px;
+    color: #9aa0b8;
+    margin-bottom: 10px;
+  }
+  #game {
+    background: #000;
+    border: 4px solid #2a2f4a;
+    box-shadow: 0 0 0 4px #0b0d17, 0 8px 30px rgba(0,0,0,0.6);
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display: block;
+  }
+  .help {
+    margin-top: 12px;
+    font-size: 9px;
+    line-height: 1.8;
+    color: #8b90a8;
+    text-align: center;
+    max-width: 640px;
+  }
+  .help b { color: var(--accent); }
+  .pill { display: inline-block; padding: 1px 6px; background: #2a2f4a; border-radius: 3px; color: #e8e8f0; margin: 0 2px; }
+  #restart {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 12px 24px;
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    cursor: pointer;
+    display: none;
+    box-shadow: 4px 4px 0 #b45309;
+  }
+  #restart:hover { background: #fff; }
+</style>
+</head>
+<body>
+  <h1>PIXEL MECHA BATTLE</h1>
+  <div class="sub">双人本地对战 · 先将对方血量打空者获胜</div>
+  <canvas id="game" width="640" height="360"></canvas>
+  <div class="help">
+    <b>玩家1（红）</b> 移动 <span class="pill">A</span><span class="pill">D</span> · 跳跃 <span class="pill">W</span> · 攻击 <span class="pill">F</span> · 防御 <span class="pill">G</span><br/>
+    <b>玩家2（蓝）</b> 移动 <span class="pill">←</span><span class="pill">→</span> · 跳跃 <span class="pill">↑</span> · 攻击 <span class="pill">K</span> · 防御 <span class="pill">L</span><br/>
+    防御可减伤 80%，但无法移动；攻击有冷却，跳起重击伤害更高
+  </div>
+  <button id="restart">再来一局 (R)</button>
+
+<script>
+/* ============================================================
+   像素机甲对战 - 核心代码
+   ------------------------------------------------------------
+   模块划分：
+     1. Palette       —— 像素调色板
+     2. Input         —— 键盘输入管理
+     3. MechSprite    —— 像素机甲绘制（按部件分块，便于动画）
+     4. Mech          —— 机甲实体（状态机 + 物理 + 战斗）
+     5. Scene         —— 场景绘制（天空/地面/远景）
+     6. Game          —— 主循环 / 碰撞 / UI / 胜负
+   ============================================================ */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const VIEW_W = 640;
+const VIEW_H = 360;
+const GROUND_Y = 300;          // 地面 y 坐标
+const GRAVITY = 0.55;
+const MOVE_SPEED = 2.2;
+const JUMP_VEL = -9.5;
+const MAX_HP = 100;
+
+// ---------- 1. 调色板 ----------
+const PAL = {
+  outline:  '#1a1423',
+  // 红方
+  rPrimary: '#e23b3b',
+  rDark:    '#8e1f1f',
+  rLight:   '#ff8a5b',
+  rVisor:   '#ffe066',
+  // 蓝方
+  bPrimary: '#3b6ee2',
+  bDark:    '#1f3f8e',
+  bLight:   '#5bc0ff',
+  bVisor:   '#a5f3ff',
+  // 通用
+  metal:    '#6b6f82',
+  metalDk:  '#3b3f52',
+  metalLt:  '#b8bccc',
+  exhaust:  '#ff9f1c',
+};
+
+// ---------- 2. 输入 ----------
+const keys = {};
+const pressed = {}; // 边沿触发：本帧新按下
+window.addEventListener('keydown', (e) => {
+  if (!keys[e.code]) pressed[e.code] = true;
+  keys[e.code] = true;
+  // 防止方向键滚屏
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+function consumePressed(code) {
+  if (pressed[code]) { pressed[code] = false; return true; }
+  return false;
+}
+
+// ---------- 3. 像素机甲绘制 ----------
+// 机甲由 head / torso / arm / leg 组成，通过参数控制朝向、动作帧、防御姿态。
+// 所有坐标基于“锚点（脚底中心）”，绘制时缩放 PX=3。
+const PX = 3; // 像素放大倍数
+
+// 把一个像素方块画到 canvas 上（带描边）
+function px(x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+
+function drawMech(x, y, facing, state, frame, palette, defending) {
+  // facing: 1 右, -1 左
+  // state: 'idle' | 'walk' | 'jump' | 'attack' | 'hurt'
+  const bob = (state === 'idle') ? Math.sin(frame * 0.08) * 1 : 0;
+  const baseY = y + bob;
+
+  ctx.save();
+  ctx.translate(x, baseY);
+  ctx.scale(facing, 1);
+
+  const P = palette;
+  const legSwing = (state === 'walk') ? Math.sin(frame * 0.25) * 3 : 0;
+  const armSwing = (state === 'walk') ? Math.sin(frame * 0.25) * 2 : 0;
+
+  // ----- 腿部 -----
+  // 后腿
+  px(-10, -16, 7, 16, P.metalDk);
+  px(-10 + legSwing*0.3, -16, 7, 16, P.metalDk);
+  // 脚
+  px(-12, -4, 11, 4, P.metal);
+  // 前腿
+  px(3, -16, 7, 16, P.primary);
+  px(3, -16, 7, 4, P.dark);
+  px(3 - legSwing*0.3, -16, 7, 16, P.primary);
+  // 前脚
+  px(1, -4, 11, 4, P.light);
+
+  // ----- 躯干 -----
+  const torsoY = -34;
+  px(-12, torsoY, 24, 20, P.primary);
+  px(-12, torsoY, 24, 4, P.light);
+  px(-12, torsoY+16, 24, 4, P.dark);
+  // 胸口核心
+  px(-4, torsoY+6, 8, 8, P.metalDk);
+  px(-3, torsoY+7, 6, 6, P.accent);
+  px(-2, torsoY+8, 2, 2, '#fff');
+
+  // 肩部装甲
+  px(-14, torsoY-2, 6, 8, P.dark);
+  px(8, torsoY-2, 6, 8, P.dark);
+  px(-14, torsoY-2, 6, 3, P.light);
+  px(8, torsoY-2, 6, 3, P.light);
+
+  // ----- 手臂 -----
+  let armX = 10, armY = torsoY+4;
+  let armLen = 14;
+  if (state === 'attack') {
+    // 出拳：手臂向前伸出
+    armX = 12; armLen = 22;
+    px(armX, armY, armLen, 6, P.primary);
+    px(armX, armY, armLen, 2, P.light);
+    // 拳头
+    px(armX+armLen, armY-2, 7, 10, P.metal);
+    px(armX+armLen, armY-2, 7, 3, P.metalLt);
+  } else if (defending) {
+    // 防御：手臂交叉在身前形成护盾
+    px(6, torsoY+2, 8, 16, P.metal);
+    px(6, torsoY+2, 8, 4, P.metalLt);
+    px(-2, torsoY+2, 8, 16, P.metal);
+    // 护盾光膜
+    ctx.globalAlpha = 0.5;
+    px(-6, torsoY-2, 22, 22, P.accent);
+    ctx.globalAlpha = 0.25;
+    px(-4, torsoY, 18, 18, '#fff');
+    ctx.globalAlpha = 1;
+  } else {
+    // 普通手臂（轻微摆动）
+    px(10, armY + armSwing, 6, 14, P.primary);
+    px(10, armY + armSwing, 6, 3, P.light);
+    px(10, armY+12 + armSwing, 6, 5, P.metal);
+    // 后臂
+    px(-14, armY - armSwing, 5, 12, P.dark);
+  }
+
+  // ----- 头部 -----
+  const headY = torsoY - 16;
+  px(-8, headY, 16, 14, P.primary);
+  px(-8, headY, 16, 3, P.light);
+  px(-8, headY+11, 16, 3, P.dark);
+  // 面罩/目镜
+  px(-6, headY+5, 12, 4, P.metalDk);
+  px(-5, headY+6, 10, 2, P.visor);
+  // 天线
+  px(2, headY-5, 2, 5, P.metal);
+  px(1, headY-7, 4, 2, P.accent);
+
+  // 攻击时喷射特效
+  if (state === 'attack') {
+    px(armX+armLen+6, armY, 4, 6, PAL.exhaust);
+    px(armX+armLen+9, armY+1, 3, 4, '#fff7cc');
+  }
+
+  ctx.restore();
+}
+
+// ---------- 4. 机甲实体 ----------
+class Mech {
+  constructor(opts) {
+    this.x = opts.x;
+    this.y = GROUND_Y;
+    this.vx = 0;
+    this.vy = 0;
+    this.facing = opts.facing;
+    this.palette = opts.palette;
+    this.name = opts.name;
+    this.hp = MAX_HP;
+    this.onGround = true;
+    this.state = 'idle';
+    this.frame = 0;
+    this.defending = false;
+    this.attackCooldown = 0;
+    this.attackTimer = 0;      // 当前攻击动作剩余帧
+    this.hitFlash = 0;         // 受击闪烁
+    this.dead = false;
+    this.win = false;
+  }
+
+  get attackHitbox() {
+    // 攻击判定框：身体前方
+    const reach = 46;
+    return {
+      x: this.facing === 1 ? this.x + 10 : this.x - 10 - reach,
+      y: this.y - 30,
+      w: reach,
+      h: 24,
+    };
+  }
+
+  get bodyBox() {
+    return { x: this.x - 14, y: this.y - 48, w: 28, h: 48 };
+  }
+
+  update(input) {
+    if (this.dead) return;
+    this.frame++;
+    if (this.attackCooldown > 0) this.attackCooldown--;
+    if (this.hitFlash > 0) this.hitFlash--;
+
+    // 防御优先级最高：按住防御键
+    this.defending = !!input.defend && this.onGround && this.attackTimer === 0;
+
+    if (this.defending) {
+      this.vx = 0;
+      this.state = 'idle';
+    } else if (this.attackTimer > 0) {
+      // 攻击中：缓慢前移，不可转向
+      this.attackTimer--;
+      this.vx = this.facing * 0.6;
+      this.state = 'attack';
+    } else {
+      // 普通移动
+      let moving = false;
+      if (input.left)  { this.vx = -MOVE_SPEED; this.facing = -1; moving = true; }
+      else if (input.right) { this.vx = MOVE_SPEED; this.facing = 1; moving = true; }
+      else this.vx = 0;
+
+      // 跳跃
+      if (input.jump && this.onGround) {
+        this.vy = JUMP_VEL;
+        this.onGround = false;
+      }
+
+      // 攻击
+      if (input.attack && this.attackCooldown === 0) {
+        this.attackTimer = 14;
+        this.attackCooldown = 30;
+        this.state = 'attack';
+      } else {
+        this.state = !this.onGround ? 'jump' : (moving ? 'walk' : 'idle');
+      }
+    }
+
+    // 物理
+    this.vy += GRAVITY;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    // 地面
+    if (this.y >= GROUND_Y) {
+      this.y = GROUND_Y;
+      this.vy = 0;
+      this.onGround = true;
+    }
+
+    // 边界
+    this.x = Math.max(20, Math.min(VIEW_W - 20, this.x));
+  }
+
+  takeDamage(amount, attackerFacing) {
+    if (this.dead) return;
+    let dmg = amount;
+    if (this.defending) dmg = Math.floor(amount * 0.2);
+    this.hp -= dmg;
+    this.hitFlash = 8;
+    // 击退
+    this.vx = attackerFacing * 3;
+    if (!this.onGround) this.vy = -3;
+    if (this.hp <= 0) {
+      this.hp = 0;
+      this.dead = true;
+      this.state = 'idle';
+    }
+    return dmg;
+  }
+
+  draw() {
+    const pal = {
+      primary: this.palette.primary,
+      dark: this.palette.dark,
+      light: this.palette.light,
+      visor: this.palette.visor,
+      accent: this.palette.accent,
+      metal: PAL.metal, metalDk: PAL.metalDk, metalLt: PAL.metalLt,
+    };
+    // 受击闪烁
+    if (this.hitFlash > 0 && this.hitFlash % 2 === 0) {
+      ctx.globalAlpha = 0.4;
+    }
+    drawMech(this.x, this.y, this.facing, this.state, this.frame, pal, this.defending);
+    ctx.globalAlpha = 1;
+
+    // 死亡倒地
+    if (this.dead) {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.facing * Math.PI / 2);
+      ctx.globalAlpha = 0.0; // 已在 drawMech 外处理，这里仅示意
+      ctx.restore();
+    }
+  }
+}
+
+// ---------- 5. 场景 ----------
+function drawScene(frame) {
+  // 天空渐变
+  const sky = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  sky.addColorStop(0, '#1a1040');
+  sky.addColorStop(0.6, '#3b1d5e');
+  sky.addColorStop(1, '#7a2d5e');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, VIEW_W, GROUND_Y);
+
+  // 星星
+  ctx.fillStyle = '#ffe9a8';
+  const stars = [[40,30],[90,60],[150,20],[210,75],[300,40],[380,25],[450,70],[520,35],[590,55],[620,20]];
+  for (const [sx, sy] of stars) {
+    const tw = (Math.sin(frame*0.05 + sx) + 1) * 0.5;
+    ctx.globalAlpha = 0.3 + tw * 0.7;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // 远景城市剪影
+  ctx.fillStyle = '#241747';
+  const buildings = [0,60,120,200,260,340,400,470,540,600];
+  buildings.forEach((bx, i) => {
+    const h = 40 + ((i*37) % 60);
+    ctx.fillRect(bx, GROUND_Y - h, 50 + (i%3)*10, h);
+  });
+  // 窗户灯光
+  ctx.fillStyle = '#ffd23f';
+  buildings.forEach((bx, i) => {
+    const h = 40 + ((i*37) % 60);
+    for (let wy = GROUND_Y - h + 8; wy < GROUND_Y - 6; wy += 12) {
+      for (let wx = bx + 6; wx < bx + 44; wx += 10) {
+        if ((wx + wy + i) % 3 === 0) ctx.fillRect(wx, wy, 3, 4);
+      }
+    }
+  });
+
+  // 地面
+  ctx.fillStyle = '#2a2030';
+  ctx.fillRect(0, GROUND_Y, VIEW_W, VIEW_H - GROUND_Y);
+  // 地面纹理
+  ctx.fillStyle = '#3a2e44';
+  for (let i = 0; i < VIEW_W; i += 16) {
+    ctx.fillRect(i, GROUND_Y, 8, 2);
+  }
+  ctx.fillStyle = '#1a1420';
+  ctx.fillRect(0, GROUND_Y, VIEW_W, 3);
+
+  // 地面装饰：管线
+  ctx.fillStyle = '#4a3e58';
+  ctx.fillRect(0, GROUND_Y + 20, VIEW_W, 4);
+  ctx.fillStyle = '#6a5e78';
+  for (let i = 20; i < VIEW_W; i += 40) ctx.fillRect(i, GROUND_Y + 18, 6, 8);
+}
+
+// ---------- 6. UI ----------
+function drawHealthBar(x, y, w, hp, color, name, facing) {
+  const h = 14;
+  // 背景框
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+  ctx.fillStyle = '#2a2030';
+  ctx.fillRect(x, y, w, h);
+  // 血量
+  const ratio = Math.max(0, hp / MAX_HP);
+  const fillW = Math.floor(w * ratio);
+  ctx.fillStyle = color;
+  if (facing === 1) {
+    ctx.fillRect(x, y, fillW, h);
+  } else {
+    ctx.fillRect(x + w - fillW, y, fillW, h);
+  }
+  // 高光
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  if (facing === 1) ctx.fillRect(x, y, fillW, 3);
+  else ctx.fillRect(x + w - fillW, y, fillW, 3);
+  // 名字
+  ctx.fillStyle = '#fff';
+  ctx.font = '10px "Courier New", monospace';
+  ctx.textBaseline = 'top';
+  if (facing === 1) ctx.fillText(name, x, y - 14);
+  else { ctx.textAlign = 'right'; ctx.fillText(name, x + w, y - 14); ctx.textAlign = 'left'; }
+  // 数字
+  ctx.fillStyle = '#ffe066';
+  ctx.fillText(String(hp), x + w/2 - 8, y + 2);
+}
+
+// ---------- 7. 游戏主控 ----------
+const P1_PAL = { primary: PAL.rPrimary, dark: PAL.rDark, light: PAL.rLight, visor: PAL.rVisor, accent: '#ffe066' };
+const P2_PAL = { primary: PAL.bPrimary, dark: PAL.bDark, light: PAL.bLight, visor: PAL.bVisor, accent: '#a5f3ff' };
+
+let p1, p2, gameOver, winner, frameCount, hitEffects;
+
+function resetGame() {
+  p1 = new Mech({ x: 180, facing: 1, palette: P1_PAL, name: 'P1 烈焰' });
+  p2 = new Mech({ x: 460, facing: -1, palette: P2_PAL, name: 'P2 寒霜' });
+  gameOver = false;
+  winner = null;
+  frameCount = 0;
+  hitEffects = [];
+  document.getElementById('restart').style.display = 'none';
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function spawnHitEffect(x, y, blocked) {
+  hitEffects.push({ x, y, life: 12, blocked });
+}
+
+function update() {
+  frameCount++;
+  if (gameOver) return;
+
+  const input1 = {
+    left: keys['KeyA'], right: keys['KeyD'],
+    jump: consumePressed('KeyW'),
+    attack: consumePressed('KeyF'),
+    defend: keys['KeyG'],
+  };
+  const input2 = {
+    left: keys['ArrowLeft'], right: keys['ArrowRight'],
+    jump: consumePressed('ArrowUp'),
+    attack: consumePressed('KeyK'),
+    defend: keys['KeyL'],
+  };
+
+  p1.update(input1);
+  p2.update(input2);
+
+  // 相互朝向修正（自动面向对手，除非正在移动/攻击）
+  // 保留玩家手动转向，这里不强制。
+
+  // 攻击判定：仅在攻击动作中段产生一次判定
+  // attackTimer 从 14 递减，命中窗口为 11..7
+  checkAttack(p1, p2, [11,10,9,8]);
+  checkAttack(p2, p1, [11,10,9,8]);
+
+  // 攻击冷却期间防止重复判定：用 attackHitDealt 标记
+  // （简化：命中窗口内只命中一次，用 hitFlash 状态防止连续掉血）
+  // 更严谨的做法：每个攻击实例一个 hasHit 标志。此处用 attackTimer 配合被击方 hitFlash>0 跳过。
+
+  // 特效更新
+  hitEffects = hitEffects.filter(e => { e.life--; return e.life > 0; });
+
+  // 胜负
+  if (p1.dead || p2.dead) {
+    gameOver = true;
+    winner = p1.dead ? p2 : p1;
+    document.getElementById('restart').style.display = 'block';
+  }
+}
+
+// 记录每个机甲本次攻击是否已命中（避免一帧多次）
+const attackHasHit = { p1: false, p2: false };
+function checkAttack(attacker, defender, windowFrames) {
+  const id = attacker === p1 ? 'p1' : 'p2';
+  if (attacker.attackTimer === 14) attackHasHit[id] = false; // 新攻击重置
+  if (attacker.attackTimer > 0 && windowFrames.includes(attacker.attackTimer) && !attackHasHit[id]) {
+    if (rectsOverlap(attacker.attackHitbox, defender.bodyBox)) {
+      const baseDmg = attacker.onGround ? 10 : 14; // 跳起重击
+      const dealt = defender.takeDamage(baseDmg, attacker.facing);
+      attackHasHit[id] = true;
+      const hb = attacker.attackHitbox;
+      spawnHitEffect(hb.x + hb.w/2, hb.y + hb.h/2, defender.defending);
+    }
+  }
+}
+
+function draw() {
+  drawScene(frameCount);
+
+  // 阴影
+  for (const m of [p1, p2]) {
+    const shadowY = GROUND_Y;
+    const dist = shadowY - m.y;
+    const scale = Math.max(0.3, 1 - dist / 120);
+    ctx.fillStyle = `rgba(0,0,0,${0.4 * scale})`;
+    ctx.beginPath();
+    ctx.ellipse(m.x, shadowY + 2, 18 * scale, 4 * scale, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // 机甲（按 y 排序，简单前后关系）
+  const order = [p1, p2].sort((a,b) => a.y - b.y);
+  for (const m of order) m.draw();
+
+  // 命中特效
+  for (const e of hitEffects) {
+    const t = 1 - e.life / 12;
+    const r = 6 + t * 16;
+    ctx.strokeStyle = e.blocked ? '#a5f3ff' : '#ffe066';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, r, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.fillStyle = e.blocked ? 'rgba(165,243,255,0.3)' : 'rgba(255,224,102,0.4)';
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, r * 0.6, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // UI 血量条
+  drawHealthBar(20, 20, 240, p1.hp, PAL.rPrimary, p1.name, 1);
+  drawHealthBar(VIEW_W - 20 - 240, 20, 240, p2.hp, PAL.bPrimary, p2.name, -1);
+
+  // VS 标记
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.font = 'bold 24px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('VS', VIEW_W/2, 30);
+  ctx.textAlign = 'left';
+
+  // 回合提示
+  ctx.fillStyle = '#9aa0b8';
+  ctx.font = '9px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('FIRST TO 0 HP LOSES', VIEW_W/2, 52);
+  ctx.textAlign = 'left';
+
+  // 胜负画面
+  if (gameOver) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.fillStyle = winner === p1 ? PAL.rPrimary : PAL.bPrimary;
+    ctx.font = 'bold 32px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(winner.name + ' 胜利!', VIEW_W/2, VIEW_H/2 - 10);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillText('按 R 或点击按钮重新开始', VIEW_W/2, VIEW_H/2 + 24);
+    ctx.textAlign = 'left';
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// 重开
+document.getElementById('restart').addEventListener('click', resetGame);
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyR' && gameOver) resetGame();
+});
+
+// 启动
+resetGame();
+loop();
+</script>
+</body>
+</html>
